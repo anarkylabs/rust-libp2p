@@ -19,6 +19,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 use std::{
+    borrow::Cow,
     collections::{
         hash_map::{DefaultHasher, Entry},
         HashMap, HashSet,
@@ -26,7 +27,7 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket},
     pin::Pin,
     task::{Context, Poll, Waker},
     time::Duration,
@@ -698,7 +699,18 @@ fn multiaddr_to_socketaddr(
 ) -> Option<(SocketAddr, ProtocolVersion, Option<PeerId>)> {
     let mut iter = addr.iter();
     let proto1 = iter.next()?;
-    let proto2 = iter.next()?;
+    let proto2_or_zone = iter.next()?;
+    // Scoped IPv6 link-local addresses are represented in multiaddr as
+    // `/ip6/<addr>/ip6zone/<scope>/udp/<port>/quic-v1`. Quinn ultimately
+    // dials a `SocketAddrV6`, so parse the zone into its `scope_id`.
+    let (proto2, scope_id) = if matches!(proto1, Protocol::Ip6(_)) {
+        match proto2_or_zone {
+            Protocol::Ip6zone(zone) => (iter.next()?, zone.parse().ok()?),
+            protocol => (protocol, 0),
+        }
+    } else {
+        (proto2_or_zone, 0)
+    };
     let proto3 = iter.next()?;
 
     let mut peer_id = None;
@@ -720,9 +732,11 @@ fn multiaddr_to_socketaddr(
         (Protocol::Ip4(ip), Protocol::Udp(port)) => {
             Some((SocketAddr::new(ip.into(), port), version, peer_id))
         }
-        (Protocol::Ip6(ip), Protocol::Udp(port)) => {
-            Some((SocketAddr::new(ip.into(), port), version, peer_id))
-        }
+        (Protocol::Ip6(ip), Protocol::Udp(port)) => Some((
+            SocketAddr::V6(SocketAddrV6::new(ip, port, 0, scope_id)),
+            version,
+            peer_id,
+        )),
         _ => None,
     }
 }
@@ -733,9 +747,18 @@ fn socketaddr_to_multiaddr(socket_addr: &SocketAddr, version: ProtocolVersion) -
         ProtocolVersion::V1 => Protocol::QuicV1,
         ProtocolVersion::Draft29 => Protocol::Quic,
     };
-    Multiaddr::empty()
-        .with(socket_addr.ip().into())
-        .with(Protocol::Udp(socket_addr.port()))
+    let mut addr = Multiaddr::empty().with(socket_addr.ip().into());
+    if let SocketAddr::V6(addr_v6) = socket_addr {
+        // Preserve the OS scope id when reporting bound/dialed link-local IPv6
+        // addresses back as multiaddrs; without it peers cannot route `fe80::`
+        // addresses on hosts with multiple interfaces.
+        if addr_v6.scope_id() != 0 {
+            addr.push(Protocol::Ip6zone(Cow::Owned(
+                addr_v6.scope_id().to_string(),
+            )));
+        }
+    }
+    addr.with(Protocol::Udp(socket_addr.port()))
         .with(quic_proto)
 }
 
@@ -801,6 +824,38 @@ mod tests {
                 ProtocolVersion::V1,
                 None
             ))
+        );
+        assert_eq!(
+            multiaddr_to_socketaddr(
+                &"/ip6/fe80::1/ip6zone/42/udp/12345/quic-v1"
+                    .parse::<Multiaddr>()
+                    .unwrap(),
+                false
+            ),
+            Some((
+                SocketAddr::V6(SocketAddrV6::new(
+                    Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+                    12345,
+                    0,
+                    42
+                )),
+                ProtocolVersion::V1,
+                None
+            ))
+        );
+        assert_eq!(
+            socketaddr_to_multiaddr(
+                &SocketAddr::V6(SocketAddrV6::new(
+                    Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+                    12345,
+                    0,
+                    42
+                )),
+                ProtocolVersion::V1
+            ),
+            "/ip6/fe80::1/ip6zone/42/udp/12345/quic-v1"
+                .parse::<Multiaddr>()
+                .unwrap()
         );
         assert_eq!(
             multiaddr_to_socketaddr(

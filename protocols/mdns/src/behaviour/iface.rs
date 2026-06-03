@@ -25,7 +25,7 @@ use std::{
     collections::VecDeque,
     future::Future,
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket},
     pin::Pin,
     sync::{Arc, RwLock},
     task::{Context, Poll},
@@ -77,6 +77,8 @@ impl ProbeState {
 pub(crate) struct InterfaceState<U, T> {
     /// Address this instance is bound to.
     addr: IpAddr,
+    /// Operating-system interface index used to scope IPv6 multicast.
+    if_index: Option<u32>,
     /// Receive socket.
     recv_socket: U,
     /// Send socket.
@@ -117,12 +119,13 @@ where
     /// Builds a new [`InterfaceState`].
     pub(crate) fn new(
         addr: IpAddr,
+        if_index: Option<u32>,
         config: Config,
         local_peer_id: PeerId,
         listen_addresses: Arc<RwLock<ListenAddresses>>,
         query_response_sender: mpsc::Sender<(PeerId, Multiaddr, Instant)>,
     ) -> io::Result<Self> {
-        tracing::info!(address=%addr, "creating instance on iface address");
+        tracing::info!(address=%addr, ?if_index, "creating mDNS interface instance");
         let recv_socket = match addr {
             IpAddr::V4(addr) => {
                 let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(socket2::Protocol::UDP))?;
@@ -136,28 +139,30 @@ where
                 U::from_std(UdpSocket::from(socket))?
             }
             IpAddr::V6(_) => {
+                let if_index = if_index.unwrap_or(0);
                 let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(socket2::Protocol::UDP))?;
                 socket.set_reuse_address(true)?;
                 #[cfg(unix)]
                 socket.set_reuse_port(true)?;
                 socket.bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 5353).into())?;
                 socket.set_multicast_loop_v6(true)?;
-                // TODO: find interface matching addr.
-                socket.join_multicast_v6(&crate::IPV6_MDNS_MULTICAST_ADDRESS, 0)?;
+                socket.join_multicast_v6(&crate::IPV6_MDNS_MULTICAST_ADDRESS, if_index)?;
                 U::from_std(UdpSocket::from(socket))?
             }
         };
         let bind_addr = match addr {
             IpAddr::V4(_) => SocketAddr::new(addr, 0),
-            IpAddr::V6(_addr) => {
-                // TODO: if-watch should return the scope_id of an address
-                // as a workaround we bind to unspecified, which means that
-                // this probably won't work when using multiple interfaces.
-                // SocketAddr::V6(SocketAddrV6::new(addr, 0, 0, scope_id))
-                SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-            }
+            IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
         };
-        let send_socket = U::from_std(UdpSocket::bind(bind_addr)?)?;
+        let mut send_socket = UdpSocket::bind(bind_addr)?;
+        if let IpAddr::V6(_) = addr {
+            if let Some(if_index) = if_index {
+                let socket = Socket::from(send_socket);
+                socket.set_multicast_if_v6(if_index)?;
+                send_socket = socket.into();
+            }
+        }
+        let send_socket = U::from_std(send_socket)?;
 
         // randomize timer to prevent all converging and firing at the same time.
         let query_interval = {
@@ -172,6 +177,7 @@ where
         };
         Ok(Self {
             addr,
+            if_index,
             recv_socket,
             send_socket,
             listen_addresses,
@@ -195,7 +201,12 @@ where
     }
 
     fn mdns_socket(&self) -> SocketAddr {
-        SocketAddr::new(self.multicast_addr, 5353)
+        match self.multicast_addr {
+            IpAddr::V4(addr) => SocketAddr::new(IpAddr::V4(addr), 5353),
+            IpAddr::V6(addr) => {
+                SocketAddr::V6(SocketAddrV6::new(addr, 5353, 0, self.if_index.unwrap_or(0)))
+            }
+        }
     }
 }
 
@@ -212,7 +223,7 @@ where
         loop {
             // 1st priority: Low latency: Create packet ASAP after timeout.
             if this.timeout.poll_next_unpin(cx).is_ready() {
-                tracing::trace!(address=%this.addr, "sending query on iface");
+                tracing::trace!(address=%this.addr, if_index=?this.if_index, "sending query on iface");
                 this.send_buffer.push_back(build_query());
                 tracing::trace!(address=%this.addr, probe_state=?this.probe_state, "tick");
 
@@ -233,7 +244,7 @@ where
             if let Some(packet) = this.send_buffer.pop_front() {
                 match this.send_socket.poll_write(cx, &packet, this.mdns_socket()) {
                     Poll::Ready(Ok(_)) => {
-                        tracing::trace!(address=%this.addr, "sent packet on iface address");
+                        tracing::trace!(address=%this.addr, if_index=?this.if_index, target=%this.mdns_socket(), "sent packet on iface address");
                         continue;
                     }
                     Poll::Ready(Err(err)) => {
@@ -272,6 +283,7 @@ where
                 Poll::Ready(Ok(Ok(Some(MdnsPacket::Query(query))))) => {
                     tracing::trace!(
                         address=%this.addr,
+                        if_index=?this.if_index,
                         remote_address=%query.remote_addr(),
                         "received query from remote address on address"
                     );
@@ -290,6 +302,7 @@ where
                 Poll::Ready(Ok(Ok(Some(MdnsPacket::Response(response))))) => {
                     tracing::trace!(
                         address=%this.addr,
+                        if_index=?this.if_index,
                         remote_address=%response.remote_addr(),
                         "received response from remote address on address"
                     );

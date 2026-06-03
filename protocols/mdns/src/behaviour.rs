@@ -29,9 +29,10 @@ use std::{
         VecDeque,
     },
     convert::Infallible,
+    ffi::CString,
     fmt,
     future::Future,
-    io,
+    io, mem,
     net::IpAddr,
     pin::Pin,
     sync::{Arc, RwLock},
@@ -40,6 +41,7 @@ use std::{
 };
 
 use futures::{channel::mpsc, Stream, StreamExt};
+use if_addrs::{get_if_addrs, Interface};
 use if_watch::IfEvent;
 use libp2p_core::{transport::PortUse, Endpoint, Multiaddr};
 use libp2p_identity::PeerId;
@@ -54,6 +56,107 @@ use crate::{
     behaviour::{socket::AsyncSocket, timer::Builder},
     Config,
 };
+
+/// Look up OS interface metadata for an address reported by `if-watch`.
+///
+/// `if-watch` gives us the address, but IPv6 mDNS needs the interface index
+/// for link-local multicast joins and sends. `if-addrs` also exposes interface
+/// flags that let us avoid virtual or point-to-point interfaces that can accept
+/// the socket setup but are not useful LAN discovery links.
+fn interface_for_addr(addr: IpAddr) -> Option<Interface> {
+    match get_if_addrs() {
+        Ok(interfaces) => interfaces
+            .into_iter()
+            .find(|interface| interface.ip() == addr),
+        Err(err) => {
+            tracing::debug!(address=%addr, error=%err, "failed to resolve interface metadata");
+            None
+        }
+    }
+}
+
+/// Return whether an interface is suitable for LAN mDNS discovery.
+///
+/// Link-local IPv6 discovery is per-interface. Creating mDNS sockets for every
+/// address can make us send on loopback, VPN, AWDL, or other virtual links where
+/// packets may fail with large-packet or no-route errors and create noisy false
+/// discovery paths. Keep the behaviour focused on active LAN-capable interfaces.
+fn should_use_mdns_interface(interface: &Interface) -> bool {
+    if !interface.is_oper_up()
+        || interface.is_loopback()
+        || interface.is_p2p()
+        || interface.name.starts_with("lo")
+    {
+        return false;
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        if !apple_interface_media_is_active(&interface.name) {
+            return false;
+        }
+        if interface.name.starts_with("awdl")
+            || interface.name.starts_with("llw")
+            || interface.name.starts_with("utun")
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[repr(C)]
+struct IfMediaReq {
+    ifm_name: [libc::c_char; libc::IFNAMSIZ],
+    ifm_current: libc::c_int,
+    ifm_mask: libc::c_int,
+    ifm_status: libc::c_int,
+    ifm_active: libc::c_int,
+    ifm_count: libc::c_int,
+    ifm_ulist: *mut libc::c_int,
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn apple_interface_media_is_active(name: &str) -> bool {
+    const SIOCGIFMEDIA: libc::c_ulong = 0xc02c6938;
+    const IFM_AVALID: libc::c_int = 0x0000_0001;
+    const IFM_ACTIVE: libc::c_int = 0x0000_0002;
+
+    let Ok(name) = CString::new(name) else {
+        return false;
+    };
+    let bytes = name.as_bytes_with_nul();
+    if bytes.len() > libc::IFNAMSIZ {
+        return false;
+    }
+
+    // SAFETY: `IfMediaReq` is a C struct where all-zero initialization is
+    // valid. We fill `ifm_name` below before passing it to `ioctl`.
+    let mut request: IfMediaReq = unsafe { mem::zeroed() };
+    for (target, source) in request.ifm_name.iter_mut().zip(bytes) {
+        *target = *source as libc::c_char;
+    }
+
+    // SAFETY: Creates a temporary datagram socket for an ioctl query.
+    let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if socket < 0 {
+        return true;
+    }
+
+    // SAFETY: `request` points to a valid writable `ifmediareq`-compatible
+    // buffer and `socket` is a live descriptor until closed below.
+    let result = unsafe { libc::ioctl(socket, SIOCGIFMEDIA, &mut request) };
+    // SAFETY: `socket` was opened above and is not used after this point.
+    let _ = unsafe { libc::close(socket) };
+
+    if result < 0 {
+        return true;
+    }
+
+    request.ifm_status & IFM_AVALID == 0 || request.ifm_status & IFM_ACTIVE != 0
+}
 
 /// An abstraction to allow for compatibility with various async runtimes.
 pub trait Provider: 'static {
@@ -293,8 +396,23 @@ where
                             continue;
                         }
                         if let Entry::Vacant(e) = self.if_tasks.entry(addr) {
+                            let interface = interface_for_addr(addr);
+                            if let Some(interface) = &interface {
+                                if !should_use_mdns_interface(interface) {
+                                    tracing::debug!(
+                                        address=%addr,
+                                        interface=%interface.name,
+                                        if_index=?interface.index,
+                                        enable_ipv6=%self.config.enable_ipv6,
+                                        "mDNS skipping unsuitable interface"
+                                    );
+                                    continue;
+                                }
+                            }
+                            let if_index = interface.and_then(|interface| interface.index);
                             match InterfaceState::<P::Socket, P::Timer>::new(
                                 addr,
+                                if_index,
                                 self.config.clone(),
                                 self.local_peer_id,
                                 self.listen_addresses.clone(),

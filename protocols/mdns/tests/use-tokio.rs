@@ -110,14 +110,17 @@ async fn run_discovery_test(config: Config) {
 }
 
 async fn create_swarm(config: Config) -> Swarm<Behaviour> {
+    let listen_addr = if config.enable_ipv6 {
+        "/ip6/::/tcp/0"
+    } else {
+        "/ip4/0.0.0.0/tcp/0"
+    };
     let mut swarm = Swarm::new_ephemeral_tokio(|key| {
         Behaviour::new(config, key.public().to_peer_id()).unwrap()
     });
 
     // Manually listen on all interfaces because mDNS only works for non-loopback addresses.
-    let expected_listener_id = swarm
-        .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
-        .unwrap();
+    let expected_listener_id = swarm.listen_on(listen_addr.parse().unwrap()).unwrap();
 
     swarm
         .wait(|e| match e {

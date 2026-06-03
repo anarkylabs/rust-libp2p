@@ -19,8 +19,9 @@
 // DEALINGS IN THE SOFTWARE.
 
 use std::{
+    borrow::Cow,
     fmt,
-    net::SocketAddr,
+    net::{Ipv6Addr, SocketAddr},
     str,
     time::{Duration, Instant},
 };
@@ -184,7 +185,11 @@ impl MdnsResponse {
                 let new_expiration = now + peer.ttl();
 
                 peer.addresses().iter().filter_map(move |address| {
+                    if !same_ip_family(address, &observed) {
+                        return None;
+                    }
                     let new_addr = _address_translation(address, &observed)?;
+                    let new_addr = add_ipv6_zone(new_addr, self.remote_addr());
                     let new_addr = new_addr.with_p2p(*peer.id()).ok()?;
 
                     Some((*peer.id(), new_addr, new_expiration))
@@ -212,6 +217,60 @@ impl MdnsResponse {
     fn discovered_peers(&self) -> impl Iterator<Item = &MdnsPeer> {
         self.peers.iter()
     }
+}
+
+/// Return whether two addresses can be translated without changing IP family.
+///
+/// mDNS receives responses per network family and interface. Translating an
+/// advertised IPv4 listen address through an observed IPv6 packet source, or
+/// vice versa, manufactures cross-family addresses that combine one socket's IP
+/// with another socket's port. Keep translations family-preserving so peers dial
+/// addresses that correspond to a real listener.
+fn same_ip_family(address: &Multiaddr, observed: &Multiaddr) -> bool {
+    match (address.iter().next(), observed.iter().next()) {
+        (Some(Protocol::Ip4(_)), Some(Protocol::Ip4(_)))
+        | (Some(Protocol::Ip6(_)), Some(Protocol::Ip6(_))) => true,
+        (Some(Protocol::Ip4(_)), Some(Protocol::Ip6(_)))
+        | (Some(Protocol::Ip6(_)), Some(Protocol::Ip4(_))) => false,
+        _ => true,
+    }
+}
+
+/// Add an `ip6zone` component to discovered link-local IPv6 addresses.
+///
+/// mDNS responses only carry the peer's IP and port. For `fe80::/10`
+/// link-local addresses that is not enough to dial: the same address can exist
+/// on multiple interfaces, so the OS also needs a scope id. The UDP socket that
+/// received the response has that scope id, so preserve it in the multiaddr.
+fn add_ipv6_zone(addr: Multiaddr, remote_addr: &SocketAddr) -> Multiaddr {
+    let SocketAddr::V6(remote_addr) = remote_addr else {
+        return addr;
+    };
+    let scope_id = remote_addr.scope_id();
+    if scope_id == 0 {
+        return addr;
+    }
+
+    let mut scoped = Multiaddr::empty();
+    let mut added_zone = false;
+    for protocol in addr.iter() {
+        match protocol {
+            Protocol::Ip6(ip) if is_ipv6_link_local(&ip) && !added_zone => {
+                scoped.push(Protocol::Ip6(ip));
+                scoped.push(Protocol::Ip6zone(Cow::Owned(scope_id.to_string())));
+                added_zone = true;
+            }
+            Protocol::Ip6zone(_) => {}
+            other => scoped.push(other),
+        }
+    }
+
+    scoped
+}
+
+/// Return whether an address is in `fe80::/10`, the IPv6 link-local prefix.
+fn is_ipv6_link_local(addr: &Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xffc0) == 0xfe80
 }
 
 impl fmt::Debug for MdnsResponse {
@@ -352,5 +411,69 @@ mod tests {
             let peer = MdnsPeer::new(&packet, record_value, ttl).expect("fail to create peer");
             assert_eq!(peer.peer_id, peer_id);
         }
+    }
+
+    #[test]
+    fn adds_ipv6_zone_to_link_local_addresses() {
+        let addr: Multiaddr = "/ip6/fe80::1/udp/1234/quic-v1"
+            .parse()
+            .expect("bad multiaddress");
+        let remote_addr = "[fe80::2%42]:5353".parse().expect("bad socket address");
+
+        assert_eq!(
+            add_ipv6_zone(addr, &remote_addr),
+            "/ip6/fe80::1/ip6zone/42/udp/1234/quic-v1"
+                .parse()
+                .expect("bad multiaddress")
+        );
+    }
+
+    #[test]
+    fn does_not_add_ipv6_zone_to_global_addresses() {
+        let addr: Multiaddr = "/ip6/2001:db8::1/udp/1234/quic-v1"
+            .parse()
+            .expect("bad multiaddress");
+        let remote_addr = "[fe80::2%42]:5353".parse().expect("bad socket address");
+
+        assert_eq!(
+            add_ipv6_zone(addr, &remote_addr),
+            "/ip6/2001:db8::1/udp/1234/quic-v1"
+                .parse()
+                .expect("bad multiaddress")
+        );
+    }
+
+    #[test]
+    fn only_translates_observed_address_with_same_ip_family() {
+        let peer_id = PeerId::random();
+        let response = MdnsResponse {
+            peers: vec![MdnsPeer {
+                addrs: vec![
+                    "/ip4/0.0.0.0/udp/1000/quic-v1"
+                        .parse()
+                        .expect("bad multiaddress"),
+                    "/ip6/::/udp/2000/quic-v1"
+                        .parse()
+                        .expect("bad multiaddress"),
+                ],
+                peer_id,
+                ttl: 60,
+            }],
+            from: "[fe80::2%42]:5353".parse().expect("bad socket address"),
+        };
+
+        let discovered = response
+            .extract_discovered(Instant::now(), PeerId::random())
+            .map(|(_, addr, _)| addr)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            discovered,
+            vec![
+                format!("/ip6/fe80::2/ip6zone/42/udp/2000/quic-v1/p2p/{peer_id}")
+                    .parse()
+                    .expect("bad multiaddress")
+            ]
+        );
     }
 }

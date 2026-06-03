@@ -12,7 +12,9 @@ categories = ["network-programming", "asynchronous"]
 
 [dependencies]
 futures = { workspace = true }
+if-addrs = { version = "0.15.0", features = ["link-local"] }
 if-watch = { workspace = true }
+libc = "0.2.155"
 libp2p-core = { workspace = true }
 libp2p-swarm = { workspace = true }
 libp2p-identity = { workspace = true }
